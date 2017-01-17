@@ -44,7 +44,6 @@ template <typename> class receiver;
 /*
  * close on a process is called when a process is in an await state to signal that no more data is coming. 
  * In response to a close, a process can switch to a yield state to yield values, otherwise it is destructed.
- * await_try is await if a value is available, otherwise yield (allowing for an interruptible task).
  */
 enum class process_state {
     await,
@@ -63,6 +62,11 @@ using process_state_scheduled = std::pair<process_state, std::chrono::system_clo
 constexpr process_state_scheduled await_forever {
     process_state::await,
     std::chrono::system_clock::time_point::max()
+};
+
+constexpr process_state_scheduled await_immediate {
+    process_state::await,
+    std::chrono::system_clock::time_point::min()
 };
 
 constexpr process_state_scheduled yield_immediate {
@@ -817,6 +821,8 @@ struct shared_process : shared_process_receiver<R>,
 
         std::tie(message, do_cts, do_close) = pop_from_queue();
 
+        bool result = bool(message); // check it now - otherwise it is moved.
+
         std::size_t i = 0;
         tuple_for_each(_upstream, [do_cts,&i](auto& u) {
             if (do_cts[i] && u) u->clear_to_send();
@@ -833,7 +839,7 @@ struct shared_process : shared_process_receiver<R>,
             else await_variant_args(_process, message.get());
         }
         else if (do_close) process_close(_process);
-        return bool(message);
+        return result;
     }
 
     template <typename U>
@@ -857,14 +863,21 @@ struct shared_process : shared_process_receiver<R>,
             is done on yield()
         */
         try {
+
             while (get_process_state(_process).first == process_state::await) {
                 if (!dequeue()) break;
             }
 
-            auto now = std::chrono::system_clock::now();
             process_state state;
             std::chrono::system_clock::time_point when;
             std::tie(state, when) = get_process_state(_process);
+
+            auto now = std::chrono::system_clock::now();
+
+            // If we are awaiting with a timeout, and the timeout expired, then yield
+            if (when <= now) {
+                state = process_state::yield;
+            }
 
             /*
                 Once we hit yield, go ahead and call it. If the yield is delayed then schedule it. This
@@ -876,7 +889,7 @@ struct shared_process : shared_process_receiver<R>,
             }
 
             /*
-                We are in an a_wait state and the queue is empty.
+                We are in an await state and the queue is empty.
 
                 If we a_wait forever then task_done() leaving us in an a_wait state.
                 else if we a_wait with an expired timeout then go ahead and yield now.
